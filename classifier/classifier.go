@@ -36,6 +36,19 @@ func (c *FormFieldClassifier) Classify(form *goquery.Selection, fields bool) Cla
 	return result
 }
 
+// ClassifyOrdered returns the form type plus document-ordered per-control
+// field classifications covering every visible control, including unnamed
+// ones. When fields is false, only the form type is computed.
+func (c *FormFieldClassifier) ClassifyOrdered(form *goquery.Selection, fields bool) (ClassifyResult, []FieldClassification) {
+	formType := c.FormModel.Classify(form)
+	result := ClassifyResult{Form: formType}
+	if fields && c.FieldModel != nil {
+		result.Fields = c.FieldModel.Classify(form, formType)
+		return result, c.FieldModel.ClassifyOrdered(form, formType)
+	}
+	return result, nil
+}
+
 // ClassifyProba returns probabilities for form and field types.
 func (c *FormFieldClassifier) ClassifyProba(form *goquery.Selection, threshold float64, fields bool) ClassifyProbaResult {
 	formProba := c.FormModel.ClassifyProba(form)
@@ -60,6 +73,34 @@ func (c *FormFieldClassifier) ClassifyProba(form *goquery.Selection, threshold f
 	}
 
 	return result
+}
+
+// ClassifyOrderedProba returns probability results plus document-ordered
+// per-control field classifications covering every visible control,
+// including unnamed ones.
+func (c *FormFieldClassifier) ClassifyOrderedProba(form *goquery.Selection, threshold float64, fields bool) (ClassifyProbaResult, []FieldClassification) {
+	formProba := c.FormModel.ClassifyProba(form)
+	filtered := thresholdMap(formProba, threshold)
+	result := ClassifyProbaResult{Form: filtered}
+
+	if fields && c.FieldModel != nil {
+		bestFormType := ""
+		bestProb := -1.0
+		for cls, prob := range formProba {
+			if prob > bestProb {
+				bestProb = prob
+				bestFormType = cls
+			}
+		}
+		fieldProba := c.FieldModel.ClassifyProba(form, bestFormType)
+		result.Fields = make(map[string]map[string]float64)
+		for name, probs := range fieldProba {
+			result.Fields[name] = thresholdMap(probs, threshold)
+		}
+		return result, c.FieldModel.ClassifyOrderedProba(form, bestFormType, threshold)
+	}
+
+	return result, nil
 }
 
 // ClassifyPage classifies the page type using form results as features.
@@ -89,9 +130,9 @@ func (c *FormFieldClassifier) ExtractPage(htmlStr string, proba bool, threshold 
 	for i, form := range forms {
 		formResults[i].FormHTML, _ = form.Html()
 		if proba {
-			formResults[i].Proba = c.ClassifyProba(form, threshold, classifyFields)
+			formResults[i].Proba, formResults[i].OrderedFields = c.ClassifyOrderedProba(form, threshold, classifyFields)
 		} else {
-			formResults[i].Result = c.Classify(form, classifyFields)
+			formResults[i].Result, formResults[i].OrderedFields = c.ClassifyOrdered(form, classifyFields)
 		}
 		classifyResults = append(classifyResults, c.Classify(form, false))
 	}
@@ -137,9 +178,9 @@ func (c *FormFieldClassifier) ExtractForms(htmlStr string, proba bool, threshold
 	for i, form := range forms {
 		results[i].FormHTML, _ = form.Html()
 		if proba {
-			results[i].Proba = c.ClassifyProba(form, threshold, classifyFields)
+			results[i].Proba, results[i].OrderedFields = c.ClassifyOrderedProba(form, threshold, classifyFields)
 		} else {
-			results[i].Result = c.Classify(form, classifyFields)
+			results[i].Result, results[i].OrderedFields = c.ClassifyOrdered(form, classifyFields)
 		}
 	}
 
@@ -159,9 +200,9 @@ func (c *FormFieldClassifier) ExtractFormsFromReader(r *strings.Reader, proba bo
 	for i, form := range forms {
 		results[i].FormHTML, _ = form.Html()
 		if proba {
-			results[i].Proba = c.ClassifyProba(form, threshold, classifyFields)
+			results[i].Proba, results[i].OrderedFields = c.ClassifyOrderedProba(form, threshold, classifyFields)
 		} else {
-			results[i].Result = c.Classify(form, classifyFields)
+			results[i].Result, results[i].OrderedFields = c.ClassifyOrdered(form, classifyFields)
 		}
 	}
 
@@ -170,9 +211,10 @@ func (c *FormFieldClassifier) ExtractFormsFromReader(r *strings.Reader, proba bo
 
 // FormResult holds the result for a single form.
 type FormResult struct {
-	FormHTML string              `json:"form_html"`
-	Result   ClassifyResult      `json:"result,omitempty"`
-	Proba    ClassifyProbaResult `json:"proba,omitempty"`
+	FormHTML      string                `json:"form_html"`
+	Result        ClassifyResult        `json:"result,omitempty"`
+	Proba         ClassifyProbaResult   `json:"proba,omitempty"`
+	OrderedFields []FieldClassification `json:"ordered_fields,omitempty"`
 }
 
 func thresholdMap(m map[string]float64, threshold float64) map[string]float64 {

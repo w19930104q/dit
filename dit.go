@@ -8,6 +8,9 @@
 //	for _, r := range results {
 //	    fmt.Println(r.Type)   // "login"
 //	    fmt.Println(r.Fields) // {"username": "username or email", "password": "password"}
+//	    // r.Form holds id/action/method; r.FieldsOrdered lists every visible
+//	    // control in document order with name, id, DOM path, type and confidence,
+//	    // preserving unnamed controls and repeated names.
 //	}
 //
 //	page, _ := c.ExtractPageType(htmlString)
@@ -24,6 +27,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/happyhackingspace/dit/captcha"
 	"github.com/happyhackingspace/dit/classifier"
 	"github.com/happyhackingspace/dit/internal/htmlutil"
@@ -41,10 +45,21 @@ type Classifier struct {
 }
 
 // FormResult holds the classification result for a single form.
+//
+// Fields preserves the original name-keyed output for backward compatibility
+// (repeated names overwrite each other and unnamed controls are absent).
+// Form and FieldsOrdered add document-ordered, name-preserving detail for
+// stable per-control RPA automation; they are produced by the same models and
+// never alter Fields.
 type FormResult struct {
 	Type    string            `json:"type"`
 	Captcha string            `json:"captcha_type,omitempty"`
 	Fields  map[string]string `json:"fields,omitempty"`
+	// Form carries the form element's id/action/method.
+	Form FormMeta `json:"form"`
+	// FieldsOrdered lists every visible control in document order, including
+	// unnamed controls and every occurrence of a repeated name.
+	FieldsOrdered []FieldInfo `json:"fields_ordered,omitempty"`
 }
 
 // FormResultProba holds probability-based classification results for a single form.
@@ -52,6 +67,11 @@ type FormResultProba struct {
 	Type    map[string]float64            `json:"type"`
 	Captcha string                        `json:"captcha_type,omitempty"`
 	Fields  map[string]map[string]float64 `json:"fields,omitempty"`
+	// Form carries the form element's id/action/method.
+	Form FormMeta `json:"form"`
+	// FieldsOrdered lists every visible control in document order with the
+	// thresholded per-label probability distribution.
+	FieldsOrdered []FieldInfoProba `json:"fields_ordered,omitempty"`
 }
 
 // PageResult holds the page type classification result.
@@ -202,28 +222,11 @@ func (c *Classifier) ExtractForms(html string) ([]FormResult, error) {
 		return nil, fmt.Errorf("dit: %w", err)
 	}
 
-	doc, err := htmlutil.LoadHTMLString(html)
+	_, forms, err := parsedForms(html)
 	if err != nil {
 		return nil, fmt.Errorf("dit: %w", err)
 	}
-	forms := htmlutil.GetForms(doc)
-
-	out := make([]FormResult, len(results))
-	detector := &captcha.CaptchaDetector{}
-	for i, r := range results {
-		capStr := ""
-		if i < len(forms) {
-			if ct := detector.DetectInForm(forms[i]); ct != captcha.CaptchaTypeNone {
-				capStr = string(ct)
-			}
-		}
-		out[i] = FormResult{
-			Type:    r.Result.Form,
-			Captcha: capStr,
-			Fields:  r.Result.Fields,
-		}
-	}
-	return out, nil
+	return assembleFormResults(results, forms), nil
 }
 
 // ExtractFormsProba extracts forms and returns classification probabilities.
@@ -238,28 +241,71 @@ func (c *Classifier) ExtractFormsProba(html string, threshold float64) ([]FormRe
 		return nil, fmt.Errorf("dit: %w", err)
 	}
 
-	doc, err := htmlutil.LoadHTMLString(html)
+	_, forms, err := parsedForms(html)
 	if err != nil {
 		return nil, fmt.Errorf("dit: %w", err)
 	}
-	forms := htmlutil.GetForms(doc)
+	return assembleFormResultsProba(results, forms), nil
+}
 
-	out := make([]FormResultProba, len(results))
-	detector := &captcha.CaptchaDetector{}
-	for i, r := range results {
-		capStr := ""
-		if i < len(forms) {
-			if ct := detector.DetectInForm(forms[i]); ct != captcha.CaptchaTypeNone {
-				capStr = string(ct)
-			}
-		}
-		out[i] = FormResultProba{
-			Type:    r.Proba.Form,
-			Captcha: capStr,
-			Fields:  r.Proba.Fields,
-		}
+// detectCaptcha returns "" when no CAPTCHA is detected, otherwise the
+// provider type string.
+func detectCaptcha(detector *captcha.CaptchaDetector, form *goquery.Selection) string {
+	if ct := detector.DetectInForm(form); ct != captcha.CaptchaTypeNone {
+		return string(ct)
 	}
-	return out, nil
+	return ""
+}
+
+// assembleFormResults builds the public hard-label form results. It is the
+// single assembly path shared by ExtractForms and ExtractPageType so the
+// per-form output (including CAPTCHA type, form metadata and ordered fields)
+// is identical regardless of the entry point.
+func assembleFormResults(internal []classifier.FormResult, forms []*goquery.Selection) []FormResult {
+	out := make([]FormResult, len(internal))
+	detector := &captcha.CaptchaDetector{}
+	for i, r := range internal {
+		fr := FormResult{
+			Type:          r.Result.Form,
+			Fields:        r.Result.Fields,
+			FieldsOrdered: toFieldInfos(r.OrderedFields),
+		}
+		if i < len(forms) {
+			fr.Captcha = detectCaptcha(detector, forms[i])
+			fr.Form = buildFormMeta(forms[i])
+		}
+		out[i] = fr
+	}
+	return out
+}
+
+// assembleFormResultsProba is the probability variant of assembleFormResults.
+// Thresholding was already applied inside the classifier.
+func assembleFormResultsProba(internal []classifier.FormResult, forms []*goquery.Selection) []FormResultProba {
+	out := make([]FormResultProba, len(internal))
+	detector := &captcha.CaptchaDetector{}
+	for i, r := range internal {
+		fr := FormResultProba{
+			Type:          r.Proba.Form,
+			Fields:        r.Proba.Fields,
+			FieldsOrdered: toFieldInfoProbas(r.OrderedFields),
+		}
+		if i < len(forms) {
+			fr.Captcha = detectCaptcha(detector, forms[i])
+			fr.Form = buildFormMeta(forms[i])
+		}
+		out[i] = fr
+	}
+	return out
+}
+
+// parsedForms loads the HTML and returns its forms in document order.
+func parsedForms(htmlStr string) (*goquery.Document, []*goquery.Selection, error) {
+	doc, err := htmlutil.LoadHTMLString(htmlStr)
+	if err != nil {
+		return nil, nil, err
+	}
+	return doc, htmlutil.GetForms(doc), nil
 }
 
 // detectPageCaptcha detects page-level CAPTCHA by first checking each form
@@ -294,18 +340,15 @@ func (c *Classifier) ExtractPageType(html string) (*PageResult, error) {
 		return nil, fmt.Errorf("dit: %w", err)
 	}
 
-	forms := make([]FormResult, len(formResults))
-	for i, r := range formResults {
-		forms[i] = FormResult{
-			Type:   r.Result.Form,
-			Fields: r.Result.Fields,
-		}
+	_, forms, err := parsedForms(html)
+	if err != nil {
+		return nil, fmt.Errorf("dit: %w", err)
 	}
 
 	return &PageResult{
 		Type:    pageResult.Form,
 		Captcha: detectPageCaptcha(html),
-		Forms:   forms,
+		Forms:   assembleFormResults(formResults, forms),
 	}, nil
 }
 
@@ -323,17 +366,14 @@ func (c *Classifier) ExtractPageTypeProba(html string, threshold float64) (*Page
 		return nil, fmt.Errorf("dit: %w", err)
 	}
 
-	forms := make([]FormResultProba, len(formResults))
-	for i, r := range formResults {
-		forms[i] = FormResultProba{
-			Type:   r.Proba.Form,
-			Fields: r.Proba.Fields,
-		}
+	_, forms, err := parsedForms(html)
+	if err != nil {
+		return nil, fmt.Errorf("dit: %w", err)
 	}
 
 	return &PageResultProba{
 		Type:    pageProba.Form,
 		Captcha: detectPageCaptcha(html),
-		Forms:   forms,
+		Forms:   assembleFormResultsProba(formResults, forms),
 	}, nil
 }

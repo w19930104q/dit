@@ -44,6 +44,17 @@ for _, r := range results {
 pageProba, _ := c.ExtractPageTypeProba(htmlString, 0.05)
 formProba, _ := c.ExtractFormsProba(htmlString, 0.05)
 
+// Stable per-control detail for RPA automation. Every visible control gets
+// one entry in document order — including unnamed controls and every
+// occurrence of a repeated name — with its id, DOM path, control type and
+// confidence. Form holds the form element's id/action/method.
+for _, r := range results {
+    fmt.Println(r.Form)            // {id, action, method}
+    for _, f := range r.FieldsOrdered {
+        fmt.Println(f.Name, f.DOMPath, f.Type, f.Confidence)
+    }
+}
+
 // Train a new model
 c, _ := dit.Train("data/", &dit.TrainConfig{Verbose: true})
 c.Save("model.json")
